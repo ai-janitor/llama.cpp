@@ -71,6 +71,7 @@ layout (push_constant) uniform parameter {
 layout (binding = 4) readonly buffer S {float data_s[];};
 
 layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
+layout (binding = 5) writeonly buffer OV2 {D_TYPEV2 data_ov2[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
@@ -82,7 +83,9 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define BINDING_IDX_V 1
 #if defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
+layout (binding = 1) readonly buffer K_PACKED2 {vec2 k_data_packed[];} k_packed2;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
+layout (binding = 2) readonly buffer V_PACKED2 {vec2 v_data_packed[];} v_packed2;
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
