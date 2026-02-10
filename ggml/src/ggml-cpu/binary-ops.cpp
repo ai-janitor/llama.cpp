@@ -61,10 +61,6 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous = (nb10 == sizeof(src1_t));
 
-    if (!is_src1_contiguous) { // broadcast not implemented yet for non-contiguous
-        GGML_ASSERT(ggml_are_same_shape(src0, src1));
-    }
-
 #ifdef GGML_USE_ACCELERATE
     vDSP_fn_t vDSP_op = nullptr;
     // TODO - avoid the f32-only check using type 'trait' lookup tables and row-based src-to-float conversion functions

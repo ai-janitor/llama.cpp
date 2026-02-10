@@ -253,7 +253,6 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
 
         GGML_ASSERT(s0 == 1);
         GGML_ASSERT(s00 == 1);
-        GGML_ASSERT(s10 == 1);
 
         const int block_size = 128;
 
