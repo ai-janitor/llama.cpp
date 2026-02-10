@@ -19,77 +19,25 @@
 
 const uint32_t HSK_per_thread = HSK / D_split;
 const uint32_t HSV_per_thread = HSV / D_split;
-const uint32_t num_groups = WorkGroupSize / D_split;
+const uint32_t groups_per_subgroup = SubGroupSize / D_split;
 
-const bool kv_split = num_groups > Br;
-const uint32_t rows_per_thread = !kv_split ? (Br / num_groups) : 1;
-const uint32_t kv_groups = kv_split ? (num_groups / Br) : 1;
+const uint32_t num_subgroups = WorkGroupSize / SubGroupSize;
+const bool kv_split = num_subgroups > Br;
+const uint32_t rows_per_thread = !kv_split ? (Br / num_subgroups) : 1;
+const uint32_t subgroups_per_row = kv_split ? (num_subgroups / Br) : 1;
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
-layout (binding = 0) readonly buffer QV2 {vec2 data_qv2[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
-layout (binding = 1) readonly buffer KV2 {f16vec2 data_kv2[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
-layout (binding = 2) readonly buffer VV2 {f16vec2 data_vv2[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
-shared float tmpsh[kv_split ? num_groups : 1];
+shared float tmpsh[kv_split ? num_subgroups : 1];
 
-const uint32_t tmpshv2_stride = (HSV / 2) + 1;
-shared ACC_TYPEV2 tmpshv2[kv_split ? num_groups * tmpshv2_stride : 1];
-
-// Store the output when doing grouped query attention.
-// Rows index by Q's dimension 2, and the first N rows are valid.
-void gqaStore2(const in uint32_t r, const in uint32_t c, const in ACC_TYPEV2 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
-{
-    uint32_t offset = (iq2 + r) * HSV / 2 + c;
-    data_ov2[o_offset + offset] = D_TYPEV2(elems);
-}
-
-#if defined(DATA_A_F32)
-FLOAT_TYPEV2 dequantize2(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    if (binding_idx == BINDING_IDX_K) {
-        return FLOAT_TYPEV2(k_packed2.k_data_packed[(a_offset + ib) * 2 + iqs / 2]);
-    } else {
-        return FLOAT_TYPEV2(v_packed2.v_data_packed[(a_offset + ib) * 2 + iqs / 2]);
-    }
-}
-#endif
-
-#if defined(DATA_A_Q4_0)
-FLOAT_TYPEV2 dequantize2(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    if (binding_idx == BINDING_IDX_K) {
-        uint vui = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2]);
-        uint shift = (iqs & 0x10) >> 2;
-        vui >>= shift;
-
-        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (FLOAT_TYPEV2(vui & 0xF, (vui >> 8) & 0xF) - FLOAT_TYPE(8.0f));
-    } else {
-        uint vui = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2]);
-        uint shift = (iqs & 0x10) >> 2;
-        vui >>= shift;
-
-        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (FLOAT_TYPEV2(vui & 0xF, (vui >> 8) & 0xF) - FLOAT_TYPE(8.0f));
-    }
-}
-#endif
-
-#if defined(DATA_A_Q8_0)
-FLOAT_TYPEV2 dequantize2(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    if (binding_idx == BINDING_IDX_K) {
-        const i8vec2 v = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2])).xy; // vec4 used due to #12147
-
-        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV2(v);
-    } else {
-        const i8vec2 v = unpack8(int32_t(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2])).xy; // vec4 used due to #12147
-
-        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV2(v);
-    }
-}
-#endif
+const uint32_t tmpshv4_stride = (HSV / 4) + 1;
+shared ACC_TYPEV4 tmpshv4[kv_split ? num_subgroups * tmpshv4_stride : 1];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -98,28 +46,26 @@ void main() {
 
     init_indices();
 
-    const uint32_t tid = gl_LocalInvocationIndex;
-    const uint32_t d_tid = gl_LocalInvocationIndex % D_split;
-    const uint32_t group_id = gl_LocalInvocationIndex / D_split;
-    const uint32_t kv_group_id = (num_groups > Br) ? (group_id % kv_groups) : 0;
+    const uint32_t d_tid = gl_SubgroupInvocationID % D_split;
+    const uint32_t group_id = gl_SubgroupInvocationID / D_split;
 
-#define tile_row(r) (!kv_split ? (group_id * rows_per_thread + (r)) : (group_id / kv_groups + (r)))
+#define tile_row(r) ((gl_SubgroupID / subgroups_per_row) * rows_per_thread + (r))
 
     const uint32_t q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02 + iq3*p.nb03) / 4;
 
-    FLOAT_TYPEV2 Qf[rows_per_thread][HSK_per_thread / 2];
+    FLOAT_TYPEV4 Qf[rows_per_thread][HSK_per_thread / 4];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
         if (tile_row(r) < N) {
-            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 2; d++) {
-                Qf[r][d] = FLOAT_TYPEV2(data_qv2[q_offset / 2 + (i * Br + tile_row(r)) * q_stride / 2 + d * D_split + d_tid] * p.scale);
+            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; d++) {
+                Qf[r][d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + tile_row(r)) * q_stride / 4 + d * D_split + d_tid] * p.scale);
             }
         }
     }
 
-    ACC_TYPEV2 Of[rows_per_thread][HSV_per_thread / 2];
-    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
+    ACC_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
+    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d] = ACC_TYPEV2(0.0);
+            Of[r][d] = ACC_TYPEV4(0.0);
         }
     }
 
@@ -167,7 +113,7 @@ void main() {
     uint32_t mask_opt_bits = 0;
 
     [[dont_unroll]]
-    for (uint32_t j = start_j + kv_group_id; j < end_j; j += kv_groups) {
+    for (uint32_t j = start_j + (gl_SubgroupID % subgroups_per_row); j < end_j; j += subgroups_per_row) {
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -182,35 +128,45 @@ void main() {
 
         ACC_TYPE Sf[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Sf[r] = ACC_TYPE(0.0);
+            Sf[r] = ACC_TYPE(-1e4);
         }
-
-        [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 2; ++d) {
-            if (KV_bounds_check && j >= KV) {
-                continue;
+        [[unroll]] for (uint32_t kq_step = 0; kq_step < D_split; ++kq_step) {
+            const uint32_t kv_pos = j * Bc + group_id * D_split + kq_step;
+            if (KV_bounds_check && kv_pos >= KV) {
+                break;
             }
 
-            FLOAT_TYPEV2 K_Tf;
-#if BLOCK_SIZE > 1
-            uint coord = j * k_stride * BLOCK_SIZE + 2 * (d * D_split + d_tid);
-            uint ib = coord / BLOCK_SIZE;
-            uint iqs = (coord % BLOCK_SIZE);
-            K_Tf = dequantize2(ib, iqs, k_offset, BINDING_IDX_K);
-#else
-            K_Tf = FLOAT_TYPEV2(data_kv2[k_offset / 2 + j * k_stride / 2 + d * D_split + d_tid]);
-#endif
+            ACC_TYPE kv_acc[rows_per_thread];
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Sf[r] += ACC_TYPE(dot(Qf[r][d], K_Tf));
+                kv_acc[r] = ACC_TYPE(0.0);
             }
-        }
 
-        // Compute sum across the D_split
-        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            if (D_split == SubGroupSize) {
-                Sf[r] = subgroupAdd(Sf[r]);
-            } else {
-                [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
-                    Sf[r] += subgroupShuffleXor(Sf[r], s);
+            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+                FLOAT_TYPEV4 K_Tf;
+#if BLOCK_SIZE > 1
+                uint coord = kv_pos * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                uint ib = coord / BLOCK_SIZE;
+                uint iqs = (coord % BLOCK_SIZE);
+                K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#else
+                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kv_pos * k_stride / 4 + d * D_split + d_tid]);
+#endif
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    kv_acc[r] += ACC_TYPE(dot(Qf[r][d], K_Tf));
+                }
+            }
+
+            // Compute sum across the D_split
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                if (D_split == SubGroupSize) {
+                    kv_acc[r] = subgroupAdd(kv_acc[r]);
+                } else {
+                    [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
+                        kv_acc[r] += subgroupShuffleXor(kv_acc[r], s);
+                    }
+                }
+                if (d_tid == kq_step) {
+                    Sf[r] = kv_acc[r];
                 }
             }
         }
@@ -222,8 +178,9 @@ void main() {
         }
 
         if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            const uint32_t kv_pos = j * Bc + group_id * D_split + d_tid;
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                FLOAT_TYPE mvf = FLOAT_TYPE(data_m[m_offset + tile_row(r) * m_stride + j]);
+                FLOAT_TYPE mvf = FLOAT_TYPE(data_m[m_offset + tile_row(r) * m_stride + kv_pos]);
 
                 Sf[r] += slope[r]*mvf;
             }
@@ -231,7 +188,7 @@ void main() {
 
         float eMf[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            float rowmaxf = float(Sf[r]);
+            float rowmaxf = float(subgroupMax(Sf[r]));
             float Moldf = Mf[r];
 
             // M = max(rowmax, Mold)
@@ -242,70 +199,78 @@ void main() {
             Lf[r] = eMf[r]*Lf[r];
         }
 
-        [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
+        [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 Of[r][d] = ACC_TYPE(eMf[r]) * Of[r][d];
             }
         }
 
-        if (!KV_bounds_check || j < KV) {
-            FLOAT_TYPE Pf[rows_per_thread];
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Pf[r] = FLOAT_TYPE(exp(float(Sf[r]) - Mf[r]));
-                Lf[r] += Pf[r];
+        FLOAT_TYPE Pf[rows_per_thread];
+        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+            Pf[r] = FLOAT_TYPE(exp(float(Sf[r]) - Mf[r]));
+            Lf[r] += subgroupAdd(Pf[r]);
+        }
+
+        [[unroll]] for (uint32_t sg_lane = 0; sg_lane < Bc; ++sg_lane) {
+            const uint32_t kv_pos = j * Bc + sg_lane;
+            if (KV_bounds_check && kv_pos >= KV) {
+                break;
             }
 
-            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                FLOAT_TYPEV2 Vf;
+            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                FLOAT_TYPEV4 Vf;
 #if BLOCK_SIZE > 1
-                uint coord = j * v_stride * BLOCK_SIZE + 2 * (d * D_split + d_tid);
+                uint coord = kv_pos * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                 uint ib = coord / BLOCK_SIZE;
                 uint iqs = (coord % BLOCK_SIZE);
-                Vf = dequantize2(ib, iqs, v_offset, BINDING_IDX_V);
+                Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
-                Vf = FLOAT_TYPEV2(data_vv2[v_offset / 2 + j * v_stride / 2 + d * D_split + d_tid]);
+                Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + kv_pos * v_stride / 4 + d * D_split + d_tid]);
 #endif
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += ACC_TYPEV2(Pf[r] * Vf);
+                    FLOAT_TYPE pf_sg = subgroupShuffle(Pf[r], sg_lane);
+
+                    Of[r][d] += ACC_TYPEV4(pf_sg * Vf);
                 }
             }
         }
     }
 
     if (kv_split) {
-        const uint base_group = group_id - kv_group_id;
+        const uint32_t base_subgroup = (gl_SubgroupID / subgroups_per_row) * subgroups_per_row;
+        const uint32_t subgroup_in_row = gl_SubgroupID % subgroups_per_row;
 
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             if (d_tid == 0) {
-                tmpsh[group_id] = Mf[r];
+                tmpsh[gl_SubgroupID] = Mf[r];
             }
             barrier();
 
-            float global_max = tmpsh[base_group];
-            [[unroll]] for (uint32_t g = 1; g < kv_groups; ++g) {
-                global_max = max(global_max, tmpsh[base_group + g]);
+            float global_max = tmpsh[base_subgroup];
+            [[unroll]] for (uint32_t g = 1; g < subgroups_per_row; ++g) {
+                global_max = max(global_max, tmpsh[base_subgroup + g]);
             }
 
             float rescale = exp(Mf[r] - global_max);
             Lf[r] *= rescale;
-            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
+            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                 Of[r][d] *= ACC_TYPE(rescale);
             }
 
             barrier();
             if (d_tid == 0) {
-                tmpsh[group_id] = Lf[r];
+                tmpsh[gl_SubgroupID] = Lf[r];
             }
-            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                tmpshv2[group_id * tmpshv2_stride + d * D_split + d_tid] = Of[r][d];
+            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                tmpshv4[gl_SubgroupID * tmpshv4_stride + d * D_split + d_tid] = Of[r][d];
             }
             barrier();
 
-            if (kv_group_id == 0) {
-                [[unroll]] for (uint32_t g = 1; g < kv_groups; ++g) {
-                    Lf[r] += tmpsh[base_group + g];
-                    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                        Of[r][d] += tmpshv2[(base_group + g) * tmpshv2_stride + d * D_split + d_tid];
+            if (subgroup_in_row == 0) {
+                [[unroll]] for (uint32_t g = 1; g < subgroups_per_row; ++g) {
+                    Lf[r] += tmpsh[base_subgroup + g];
+                    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                        Of[r][d] += tmpshv4[(base_subgroup + g) * tmpshv4_stride + d * D_split + d_tid];
                     }
                 }
                 Mf[r] = global_max;
@@ -313,7 +278,7 @@ void main() {
             barrier();
         }
 
-        if (kv_group_id != 0) {
+        if (subgroup_in_row != 0) {
             return;
         }
     }
@@ -322,13 +287,13 @@ void main() {
     // division by L. Store the intermediate O value and per-row m and L values.
     if (p.k_num > 1) {
         // note: O and Q have swapped coord 1,2.
-        uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 2;
+        uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
 
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (row < N) {
-                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                    gqaStore2(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
                 }
             }
         }
@@ -355,7 +320,7 @@ void main() {
             if (sink > Mf[r]) {
                 ms = exp(Mf[r] - sink);
 
-                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                     Of[r][d] *= ACC_TYPE(ms);
                 }
             } else {
@@ -371,7 +336,7 @@ void main() {
         Lfrcp[r] = (Lf[r] == 0.0) ? 0.0 : (1.0 / Lf[r]);
     }
 
-    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
+    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             Of[r][d] *= ACC_TYPE(Lfrcp[r]);
 #if defined(ACC_TYPE_MAX)
@@ -380,14 +345,14 @@ void main() {
         }
     }
 
-    uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 2;
+    uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
 
     if (p.gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (row < N) {
-                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                    gqaStore2(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
                 }
             }
         }
@@ -395,8 +360,8 @@ void main() {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (i * Br + row < N) {
-                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 2; ++d) {
-                    data_ov2[o_offset + (iq2 * HSV + (i * Br + row) * p.ne1 * HSV) / 2 + d * D_split + d_tid] = D_TYPEV2(Of[r][d]);
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                    data_ov4[o_offset + (iq2 * HSV + (i * Br + row) * p.ne1 * HSV) / 4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
                 }
             }
         }

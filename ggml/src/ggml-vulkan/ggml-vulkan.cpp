@@ -2797,11 +2797,32 @@ static constexpr uint32_t coopmat1_flash_attention_num_large_rows = 16;
 static constexpr uint32_t scalar_flash_attention_Bc = 64;
 static constexpr uint32_t scalar_flash_attention_workgroup_size = 128;
 
-static std::array<uint32_t, 2> fa_rows_cols(FaCodePath path, uint32_t hsk, uint32_t hsv, uint32_t clamp, ggml_type type, FaRows rows, bool small_cache) {
+static bool fa_disable_subgroups(const vk_device& device, FaCodePath path) {
+    return device->vendor_id == VK_VENDOR_ID_INTEL && path == FA_SCALAR;
+}
+
+static uint32_t fa_subgroup_size(const vk_device& device, FaCodePath path) {
+    if (fa_disable_subgroups(device, path)) {
+        return 0xFFFFFFFF;
+    }
+
+    uint32_t subgroup_size;
+    switch (path) {
+    case FA_VECTOR:
+        subgroup_size = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ? 32 : device->subgroup_size;
+        break;
+    default:
+        subgroup_size = device->subgroup_size;
+    }
+
+    return subgroup_size;
+}
+
+static std::array<uint32_t, 2> fa_rows_cols(const vk_device& device, FaCodePath path, uint32_t hsk, uint32_t hsv, uint32_t clamp, ggml_type type, FaRows rows, bool small_cache) {
     GGML_UNUSED(clamp);
 
     if (path == FA_VECTOR) {
-        return {get_fa_vector_num_rows(rows), 1};
+        return {get_fa_vector_num_rows(rows), fa_subgroup_size(device, FA_VECTOR)};
     }
 
     if (path == FA_SCALAR) {
@@ -2835,8 +2856,8 @@ static std::array<uint32_t, 2> fa_rows_cols(FaCodePath path, uint32_t hsk, uint3
     return {64, 64};
 }
 
-static uint32_t fa_align(FaCodePath path, uint32_t hsk, uint32_t hsv, ggml_type type, FaRows rows, bool small_cache) {
-    return fa_rows_cols(path, hsk, hsv, 0, type, rows, small_cache)[1];
+static uint32_t fa_align(const vk_device& device, FaCodePath path, uint32_t hsk, uint32_t hsv, ggml_type type, FaRows rows, bool small_cache) {
+    return fa_rows_cols(device, path, hsk, hsv, 0, type, rows, small_cache)[1];
 }
 
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
@@ -3204,25 +3225,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     };
 
     auto const &fa_wg_denoms = [&](FaCodePath path, uint32_t hsk, uint32_t hsv, uint32_t clamp, ggml_type type, FaRows rows, bool small_cache) -> std::array<uint32_t, 3> {
-        return {fa_rows_cols(path, hsk, hsv, clamp, type, rows, small_cache)[0], 1, 1};
-    };
-
-    const bool disable_subgroups = device->vendor_id == VK_VENDOR_ID_INTEL;
-
-    auto const &fa_subgroup_size = [&](FaCodePath path) -> uint32_t {
-        uint32_t subgroup_size;
-        switch (path) {
-        case FA_VECTOR:
-            subgroup_size = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ? 32 : device->subgroup_size;
-            break;
-        case FA_SCALAR:
-            subgroup_size = disable_subgroups ? 0xFFFFFFFF : device->subgroup_size;
-            break;
-        default:
-            subgroup_size = device->subgroup_size;
-        }
-
-        return subgroup_size;
+        return {fa_rows_cols(device, path, hsk, hsv, clamp, type, rows, small_cache)[0], 1, 1};
     };
 
     auto const &fa_spec_constants = [&](FaCodePath path, uint32_t hsk, uint32_t hsv, uint32_t clamp, ggml_type type, FaRows rows, bool small_cache, uint32_t flags) -> std::vector<uint32_t> {
@@ -3232,7 +3235,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         // For scalar, use 128 (arbitrary)
         // The same D_split value is used for both HSK and HSV, so just base it on the union of the LSBs.
         const uint32_t D = (hsk|hsv);
-        auto rows_cols = fa_rows_cols(path, hsk, hsv, clamp, type, rows, small_cache);
+        auto rows_cols = fa_rows_cols(device, path, hsk, hsv, clamp, type, rows, small_cache);
 
         uint32_t wg_size;
         switch (path) {
@@ -3246,7 +3249,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             wg_size = 128;
             break;
         default:
-            if (disable_subgroups) {
+            if (device->vendor_id == VK_VENDOR_ID_INTEL) {
                 wg_size = 128;
             } else if (device->subgroup_size > 32 && rows_cols[0] < 4) {
                 wg_size = device->subgroup_size * 2;
@@ -3261,9 +3264,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t D_lsb = D ^ (D & (D-1));
         uint32_t D_split;
         if (path == FA_VECTOR) {
-            D_split = std::min(std::min(device->subgroup_size, 32u), D_lsb / 2);
+            D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
         } else {
-            D_split = std::min(std::min(device->subgroup_size,  8u), D_lsb / 4);
+            D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
         }
 
         // Nvidia prefers shared memory use to load large tiles of K/V.
@@ -3271,7 +3274,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         // AMD prefers loading K directly from global memory
         const uint32_t shmem_staging = device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256 ? 1 : 0;
 
-        const uint32_t subgroup_size = fa_subgroup_size(path);
+        const uint32_t subgroup_size = fa_subgroup_size(device, path);
 
         return {wg_size, rows_cols[0], rows_cols[1], hsk, hsv, clamp, D_split, subgroup_size, shmem_staging, flags};
     };
@@ -3286,19 +3289,19 @@ static void ggml_vk_load_shaders(vk_device& device) {
             bool aligned = fa.first.aligned; \
             bool f32acc = fa.first.f32acc; \
             uint32_t flags = fa.first.flags; \
-            bool path_disable_subgroups = disable_subgroups && path == FA_SCALAR; \
+            bool path_disable_subgroups = fa_disable_subgroups(device, path); \
             if (path == FAPATH) { \
                 if (aligned) { \
                     if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f32acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,rows,small_cache,flags), fa_align(FAPATH,HSK,HSV,TYPE,rows,small_cache), true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(path) : 0));     \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f32acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,rows,small_cache,flags), fa_align(device, FAPATH,HSK,HSV,TYPE,rows,small_cache), true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(device, path) : 0));     \
                     } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f16acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,rows,small_cache,flags), fa_align(FAPATH,HSK,HSV,TYPE,rows,small_cache), true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(path) : 0));     \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f16acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,rows,small_cache,flags), fa_align(device, FAPATH,HSK,HSV,TYPE,rows,small_cache), true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(device, path) : 0));     \
                     } \
                 } else { \
                     if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f32acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,rows,small_cache,flags), 1,                                        true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(path) : 0));     \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f32acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,rows,small_cache,flags), 1,                                        true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(device, path) : 0));     \
                     } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f16acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,rows,small_cache,flags), 1,                                        true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(path) : 0));     \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f16acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,rows,small_cache), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,rows,small_cache,flags), 1,                                        true, (!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)), ((!path_disable_subgroups && (FAPATH!=FA_COOPMAT2)) ? fa_subgroup_size(device, path) : 0));     \
                     } \
                 } \
             } \
@@ -8475,7 +8478,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type kv_type) {
     // Needs to be kept up to date on shader changes
     GGML_UNUSED(hsv);
-    const auto rows_cols = fa_rows_cols(FA_COOPMAT1, hsk, hsv, 0, kv_type, FA_ROWS_LARGE, false);
+    const auto rows_cols = fa_rows_cols(device, FA_COOPMAT1, hsk, hsv, 0, kv_type, FA_ROWS_LARGE, false);
     const uint32_t Br = rows_cols[0];
     const uint32_t Bc = rows_cols[1];
 
@@ -8663,7 +8666,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         v_stride /= 4;
     }
 
-    uint32_t alignment = fa_align(path, HSK, HSV, k->type, rows, small_cache);
+    uint32_t alignment = fa_align(ctx->device, path, HSK, HSV, k->type, rows, small_cache);
     bool aligned = (KV % alignment) == 0 &&
                    // the "aligned" shader variant will forcibly align strides, for performance
                    (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
@@ -8745,7 +8748,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
 
-    auto rows_cols = fa_rows_cols(path, HSK, HSV, !aligned, k->type, rows, small_cache);
+    auto rows_cols = fa_rows_cols(ctx->device, path, HSK, HSV, !aligned, k->type, rows, small_cache);
     const uint32_t Br = rows_cols[0];
     const uint32_t Bc = rows_cols[1];
 
