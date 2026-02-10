@@ -7109,6 +7109,113 @@ void ggml_compute_forward_conv_2d_dw(
     }
 }
 
+// ggml_compute_forward_istft
+//
+// iSTFT = inverse Short-Time Fourier Transform. Converts a complex spectrogram
+// back to real audio. Three steps per frame:
+//   1. irfft (complex→real via PocketFFT, O(n log n) per frame)
+//   2. Hann window multiplication
+//   3. Overlap-add (fold) — frames overlap by (win_length - hop_length) samples
+//
+// Threading: each thread irfft's its own frames into a shared scratch buffer
+// (n_frames × n_fft). Thread 0 then does the sequential fold + normalize.
+// This matches the original tts.cpp pattern (threads for irfft, sequential fold).
+
+#include "pocketfft_hdronly.h"
+#include <complex>
+
+void ggml_compute_forward_istft(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+
+    const int32_t n_fft       = dst->op_params[0];
+    const int32_t hop_length  = dst->op_params[1];
+    const int32_t win_length  = dst->op_params[2];
+    const int32_t n_frames    = (int32_t)src->ne[2];
+    const int32_t n_freq      = n_fft / 2 + 1;
+    const int32_t n_pad       = (win_length - hop_length) / 2;
+    const int64_t n_out_full  = (int64_t)(n_frames - 1) * hop_length + win_length;
+    const int64_t n_out       = n_out_full - 2 * n_pad;
+
+    GGML_ASSERT(dst->ne[0] == n_out);
+    GGML_ASSERT(src->ne[0] == 2);        // interleaved re/im
+    GGML_ASSERT(src->ne[1] == n_freq);   // frequency bins
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Scratch space from graph planner (requested in ggml-cpu.c extra_work_size):
+    // Layout: [all_res: n_frames * n_fft floats][all_hann2: n_frames * n_fft floats]
+    const int64_t scratch_per_buf = (int64_t)n_frames * n_fft;
+    float * all_res   = (float *)params->wdata;
+    float * all_hann2 = all_res + scratch_per_buf;
+
+    // Thread 0 zeroes the scratch buffers
+    if (ith == 0) {
+        memset(all_res,   0, scratch_per_buf * sizeof(float));
+        memset(all_hann2, 0, scratch_per_buf * sizeof(float));
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Hann window (each thread computes — cheap, avoids shared state)
+    std::vector<float> hann(win_length);
+    for (int i = 0; i < win_length; i++) {
+        hann[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / win_length));
+    }
+
+    // PocketFFT c2r setup
+    pocketfft::shape_t  shape_out  = {(size_t)n_fft};
+    pocketfft::stride_t stride_in  = {(ptrdiff_t)sizeof(std::complex<float>)};
+    pocketfft::stride_t stride_out = {(ptrdiff_t)sizeof(float)};
+
+    const float * src_data = (const float *)src->data;
+    float       * dst_data = (float *)dst->data;
+
+    // Phase 1: each thread irfft's + windows its assigned frames.
+    // Each thread writes to non-overlapping frame indices, so no data race.
+    std::vector<float> frame_real(n_fft);
+
+    for (int l = ith; l < n_frames; l += nth) {
+        const float * frame_cplx = src_data + (int64_t)l * n_freq * 2;
+        const auto * cplx_in = reinterpret_cast<const std::complex<float> *>(frame_cplx);
+
+        pocketfft::c2r(shape_out, stride_in, stride_out, /*axis=*/0,
+                        /*forward=*/false, cplx_in, frame_real.data(), 1.0f / n_freq);
+
+        for (int j = 0; j < n_fft; j++) {
+            all_res  [(int64_t)l * n_fft + j] = frame_real[j] * hann[j];
+            all_hann2[(int64_t)l * n_fft + j] = hann[j] * hann[j];
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Phase 2: thread 0 does overlap-add (fold) + normalize — sequential
+    if (ith == 0) {
+        std::vector<float> audio(n_out_full, 0.0f);
+        std::vector<float> env(n_out_full, 0.0f);
+
+        for (int l = 0; l < n_frames; l++) {
+            int64_t offset = (int64_t)l * hop_length;
+            for (int j = 0; j < win_length; j++) {
+                int64_t idx = offset + j;
+                if (idx < n_out_full) {
+                    audio[idx] += all_res  [(int64_t)l * n_fft + j];
+                    env[idx]   += all_hann2[(int64_t)l * n_fft + j];
+                }
+            }
+        }
+
+        // normalize by windowed envelope, trim padding
+        for (int64_t i = 0; i < n_out; i++) {
+            dst_data[i] = (env[i + n_pad] > 0.0f) ? audio[i + n_pad] / env[i + n_pad] : 0.0f;
+        }
+    }
+}
+
 // ggml_compute_forward_pool_1d_ksp
 static void ggml_compute_forward_pool_1d_ksp(
         const ggml_compute_params * params,
