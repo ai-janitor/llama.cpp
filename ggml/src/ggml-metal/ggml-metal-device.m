@@ -1153,7 +1153,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
                 return has_simdgroup_reduction;
             }
-            return has_simdgroup_mm;
+            if (has_simdgroup_mm) {
+                return true;
+            }
+            // SCALAR fallback for GPUs without simdgroup matrix multiply (AMD, older Apple)
+            if (op->src[0]->ne[0] == 64 ||
+                op->src[0]->ne[0] == 128 ||
+                op->src[0]->ne[0] == 256) {
+                return true;
+            }
+            return false;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
