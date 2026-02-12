@@ -6090,6 +6090,8 @@ struct test_flash_attn_ext : public test_case {
     const ggml_prec prec;
     const ggml_type type_KV;
     std::array<int32_t, 4> permute;
+    const bool kv_is_view; // whether K/V are views with 2x stride padding (default true matches most tests)
+    const bool causal_mask; // use causal mask with -INF for future positions (like real inference)
 
     std::string vars() override {
         return VARS_TO_STR13(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, permute);
@@ -6108,8 +6110,8 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV), permute(permute) {}
+                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool kv_is_view = true, bool causal_mask = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV), permute(permute), kv_is_view(kv_is_view), causal_mask(causal_mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
@@ -6137,7 +6139,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_KV,       hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_KV,       hsk_padded, kv, nh,         nr23[1], kv_is_view); // K is a view of the KV cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -6151,7 +6153,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_KV,       hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_KV,       hsv_padded, kv, nh,         nr23[1], kv_is_view); // V is a view of the KV cache
         }
         ggml_set_name(v, "v");
 
@@ -6181,7 +6183,31 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (causal_mask) {
+                    // causal mask: 0.0 for visible positions, -INF for future positions
+                    // mask shape: [kv, nb, 1, nr23[1]]
+                    const int64_t ne0 = t->ne[0]; // kv
+                    const int64_t ne1 = t->ne[1]; // nb
+                    const int64_t ne2 = t->ne[2];
+                    const int64_t ne3 = t->ne[3];
+                    std::vector<ggml_fp16_t> data(ne0 * ne1 * ne2 * ne3);
+                    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+                    const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
+                    for (int64_t i3 = 0; i3 < ne3; i3++) {
+                        for (int64_t i2 = 0; i2 < ne2; i2++) {
+                            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                                for (int64_t i0 = 0; i0 < ne0; i0++) {
+                                    const int64_t idx = i3*ne2*ne1*ne0 + i2*ne1*ne0 + i1*ne0 + i0;
+                                    // query at position i1 can attend to KV positions 0..i1
+                                    data[idx] = (i0 <= i1) ? zero : neg_inf;
+                                }
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -8283,6 +8309,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Qwen2.5-1.5B on AMD: nh=2 KV heads, nr2=6 (GQA ratio 6), kv=256, nb=1/2 (vec path)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
+    // same but permuted — tests interleaved KV cache layout (nb12 < nb11), matching inference strides
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}));
+    // same but with sinks=false — exact match for inference (has_mask=1, has_sinks=0)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}));
+    // BUG-002 repro: use is_view=false for K to get ns10=256 (exact inference stride, no 2x padding)
+    // Standard tests always use is_view=true which gives ns10=512 — never exercises the inference code path
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    // BUG-002 repro: causal mask with -INF for future positions (matches real inference)
+    // Standard tests use random uniform mask that never exercises the -INF skip path (line 6094 in shader)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 12, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 256, 1,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}, false, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
