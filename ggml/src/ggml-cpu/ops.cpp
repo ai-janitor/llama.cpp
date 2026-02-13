@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -7113,16 +7114,55 @@ void ggml_compute_forward_conv_2d_dw(
 //
 // iSTFT = inverse Short-Time Fourier Transform. Converts a complex spectrogram
 // back to real audio. Three steps per frame:
-//   1. irfft (complex→real via PocketFFT, O(n log n) per frame)
+//   1. irfft (complex→real via direct inverse DFT, O(n²) per frame)
 //   2. Hann window multiplication
 //   3. Overlap-add (fold) — frames overlap by (win_length - hop_length) samples
 //
 // Threading: each thread irfft's its own frames into a shared scratch buffer
 // (n_frames × n_fft). Thread 0 then does the sequential fold + normalize.
-// This matches the original tts.cpp pattern (threads for irfft, sequential fold).
 
-#include "pocketfft_hdronly.h"
-#include <complex>
+// Direct inverse real FFT using Hermitian symmetry.
+// For a real-valued signal of length n_fft with n_freq = n_fft/2+1 complex bins:
+//   out[j] = (1/n_freq) * (X[0].re
+//            + 2 * sum_{k=1}^{n_freq-2} (X[k].re*cos(2πkj/n_fft) - X[k].im*sin(2πkj/n_fft))
+//            + X[n_freq-1].re*cos(2π(n_freq-1)j/n_fft) - X[n_freq-1].im*sin(2π(n_freq-1)j/n_fft))
+// This matches the Vulkan istft.comp shader algorithm.
+static void ggml_irfft_direct(
+        const float * cplx_in,   // interleaved [re,im] × n_freq
+        float       * out,       // real output, length n_fft
+        int           n_fft,
+        int           n_freq) {
+
+    const float inv_n_freq = 1.0f / (float)n_freq;
+    const float two_pi_over_n = 6.28318530718f / (float)n_fft;
+
+    for (int j = 0; j < n_fft; j++) {
+        const float angle_base = two_pi_over_n * (float)j;
+        float val = 0.0f;
+
+        // DC component (k=0): cos(0)=1, sin(0)=0
+        val += cplx_in[0];
+
+        // Middle frequencies (k=1..n_freq-2): doubled due to Hermitian symmetry
+        for (int k = 1; k < n_freq - 1; k++) {
+            float re = cplx_in[k * 2 + 0];
+            float im = cplx_in[k * 2 + 1];
+            float angle = angle_base * (float)k;
+            val += 2.0f * (re * cosf(angle) - im * sinf(angle));
+        }
+
+        // Nyquist component (k=n_freq-1): appears once
+        {
+            int k = n_freq - 1;
+            float re = cplx_in[k * 2 + 0];
+            float im = cplx_in[k * 2 + 1];
+            float angle = angle_base * (float)k;
+            val += re * cosf(angle) - im * sinf(angle);
+        }
+
+        out[j] = val * inv_n_freq;
+    }
+}
 
 void ggml_compute_forward_istft(
         const ggml_compute_params * params,
@@ -7166,11 +7206,6 @@ void ggml_compute_forward_istft(
         hann[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / win_length));
     }
 
-    // PocketFFT c2r setup
-    pocketfft::shape_t  shape_out  = {(size_t)n_fft};
-    pocketfft::stride_t stride_in  = {(ptrdiff_t)sizeof(std::complex<float>)};
-    pocketfft::stride_t stride_out = {(ptrdiff_t)sizeof(float)};
-
     const float * src_data = (const float *)src->data;
     float       * dst_data = (float *)dst->data;
 
@@ -7180,10 +7215,8 @@ void ggml_compute_forward_istft(
 
     for (int l = ith; l < n_frames; l += nth) {
         const float * frame_cplx = src_data + (int64_t)l * n_freq * 2;
-        const auto * cplx_in = reinterpret_cast<const std::complex<float> *>(frame_cplx);
 
-        pocketfft::c2r(shape_out, stride_in, stride_out, /*axis=*/0,
-                        /*forward=*/false, cplx_in, frame_real.data(), 1.0f / n_freq);
+        ggml_irfft_direct(frame_cplx, frame_real.data(), n_fft, n_freq);
 
         for (int j = 0; j < n_fft; j++) {
             all_res  [(int64_t)l * n_fft + j] = frame_real[j] * hann[j];
