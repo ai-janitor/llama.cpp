@@ -6075,7 +6075,8 @@ kernel void kernel_flash_attn_ext_vec(
             }
 
             // skip -INF blocks
-            if (simd_max(sm[tiisg]) <= -MAXHALF) {
+            // NOTE: use float cast to avoid simd_max(half) bug on AMD RDNA
+            if (simd_max(float(sm[tiisg])) <= -65504.0f) {
                 continue;
             }
 

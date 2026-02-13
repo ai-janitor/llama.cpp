@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
 
@@ -1148,7 +1149,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            // vec kernels only need simdgroup_reduction, not simdgroup_mm
+            if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
+                return has_simdgroup_reduction;
+            }
+            return has_simdgroup_mm;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
