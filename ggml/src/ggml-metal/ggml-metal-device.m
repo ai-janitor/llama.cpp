@@ -1148,7 +1148,23 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            if (has_simdgroup_mm) {
+                return true;
+            }
+            // SCALAR fallback for GPUs without simdgroup matrix multiply (AMD, older Apple)
+            // requires simdgroup_reduction (simd_sum/simd_max) and f16 K/V
+            if (has_simdgroup_reduction &&
+                (op->src[0]->ne[0] == 64 ||
+                 op->src[0]->ne[0] == 128 ||
+                 op->src[0]->ne[0] == 256)) {
+                if (op->src[1]->type != GGML_TYPE_F16) {
+                    GGML_LOG_WARN("%s: SCALAR Flash Attention requires f16 K/V cache, but got %s — falling back to CPU\n",
+                        __func__, ggml_type_name(op->src[1]->type));
+                    return false;
+                }
+                return true;
+            }
+            return false;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
